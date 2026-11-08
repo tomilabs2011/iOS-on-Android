@@ -1,0 +1,185 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# ios: start/stop and control the emulated iPod touch (iPhone OS 3.1.3).
+# Installed into Termux by setup.sh. Run `ios help` for the list of commands.
+
+set -uo pipefail
+
+STATE="$HOME/.ios-on-android"
+# shellcheck source=../../config.env
+. "$STATE/config.env" 2>/dev/null || { echo "ios: not set up yet, run setup.sh first" >&2; exit 1; }
+
+PIDF="$STATE/emulator.pid"
+LOG="$STATE/emulator.log"
+VNC_PORT=$((5900 + IOA_VNC_DISPLAY))
+
+B=$'\033[1m'; Y=$'\033[33m'; N=$'\033[0m'
+say()  { printf '%s\n' "$*"; }
+warn() { printf '%s%s%s\n' "$Y" "$*" "$N" >&2; }
+
+running() { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
+port_open() { nc -z -w 1 127.0.0.1 "$1" >/dev/null 2>&1; }
+monitor() { printf '%s\n' "$*" | nc -N -w 3 127.0.0.1 "$IOA_MONITOR_PORT" >/dev/null 2>&1; }
+in_debian() { proot-distro login debian -- "$@"; }
+
+open_viewer() {
+  if am start -a android.intent.action.VIEW -d "vnc://127.0.0.1:$VNC_PORT" >/dev/null 2>&1; then
+    say "Opened AVNC. Come back to Termux any time to use the ios commands."
+  else
+    warn "Couldn't open AVNC automatically. Open AVNC, add server 127.0.0.1 port $VNC_PORT, connect."
+  fi
+}
+
+cmd_start() {
+  local flags=() viewer=1 a i
+  for a in "$@"; do
+    case "$a" in
+      --wifi|--sound) flags+=("$a") ;;
+      --no-viewer) viewer=0 ;;
+      *) warn "unknown option: $a"; return 2 ;;
+    esac
+  done
+  if running; then
+    say "iOS is already running."
+    [ $viewer = 1 ] && open_viewer
+    return 0
+  fi
+  if port_open "$VNC_PORT" || port_open "$IOA_MONITOR_PORT"; then
+    warn "Port $VNC_PORT or $IOA_MONITOR_PORT is in use by something else. Try 'ios stop' or reboot the phone."
+    return 1
+  fi
+  case " ${flags[*]-} " in
+    *" --sound "*)
+      pulseaudio --check 2>/dev/null || pulseaudio --start --exit-idle-time=-1 \
+        --load="module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1" \
+        || warn "PulseAudio didn't start; continuing without sound."
+      ;;
+  esac
+  termux-wake-lock 2>/dev/null || true
+  say "Starting the emulated iPod touch (iPhone OS $IOA_IOS_VERSION)..."
+  nohup proot-distro login debian -- /opt/ios-on-android/run.sh "${flags[@]+"${flags[@]}"}" >"$LOG" 2>&1 &
+  echo $! >"$PIDF"
+  for i in $(seq 1 90); do
+    if port_open "$VNC_PORT"; then break; fi
+    if ! running; then
+      warn "The emulator stopped right away. Last lines of the log:"
+      tail -n 25 "$LOG" >&2
+      rm -f "$PIDF"; termux-wake-unlock 2>/dev/null || true
+      return 1
+    fi
+    sleep 1
+  done
+  port_open "$VNC_PORT" || { warn "The screen never came up. See: ios log"; return 1; }
+  say "Booting: expect a black screen, then the Apple logo, for a few minutes."
+  say "Buttons: in AVNC open the keyboard and press ${B}h${N} = Home, ${B}p${N} = Power. Or run 'ios home' here."
+  [ $viewer = 1 ] && open_viewer
+  return 0
+}
+
+cmd_stop() {
+  local i
+  if ! running; then say "iOS isn't running."; rm -f "$PIDF"; return 0; fi
+  say "Stopping. (For a clean shutdown, first do 'ios off' and slide to power off.)"
+  monitor quit
+  for i in $(seq 1 20); do running || break; sleep 1; done
+  if running; then kill "$(cat "$PIDF")" 2>/dev/null; sleep 2; fi
+  if running; then kill -9 "$(cat "$PIDF")" 2>/dev/null; fi
+  rm -f "$PIDF"
+  termux-wake-unlock 2>/dev/null || true
+  say "Stopped."
+}
+
+need_running() { running || { warn "iOS isn't running. Start it with: ios"; exit 1; }; }
+
+cmd_screenshot() {
+  need_running
+  local dir="/sdcard/Pictures/iOS-on-Android" name
+  name="iOS-$(date +%Y%m%d-%H%M%S).png"
+  mkdir -p "$dir" 2>/dev/null || dir="$HOME"
+  in_debian python3 -I /opt/ios-on-android/ioatool.py screenshot /root/ios/logs/shot.png \
+    && in_debian cat /root/ios/logs/shot.png >"$dir/$name" \
+    && say "Saved $dir/$name (it shows up in the Gallery)."
+}
+
+cmd_selftest() {
+  if running; then warn "Stop iOS first (ios stop); the self-test boots its own copy."; return 1; fi
+  termux-wake-lock 2>/dev/null || true
+  in_debian python3 -I /opt/ios-on-android/ioatool.py selftest "${1:-600}"
+  local rc=$?
+  in_debian cat /root/ios/logs/selftest.png >/sdcard/Download/ios-selftest.png 2>/dev/null \
+    && say "Screenshot copied to /sdcard/Download/ios-selftest.png"
+  termux-wake-unlock 2>/dev/null || true
+  return $rc
+}
+
+cmd_status() {
+  if running; then say "Running (pid $(cat "$PIDF")), screen on 127.0.0.1:$VNC_PORT"; else say "Not running."; fi
+  say "Emulated iPod data: $(in_debian du -sh /root/ios/device/nandrw 2>/dev/null | awk '{print $1}') written so far"
+}
+
+cmd_log() {
+  say "== emulator ($LOG)"; tail -n 40 "$LOG" 2>/dev/null
+  say "== iPod serial console"; in_debian tail -n 40 /root/ios/logs/serial.log 2>/dev/null
+}
+
+cmd_reset() {
+  local a
+  running && { warn "Stop iOS first: ios stop"; return 1; }
+  printf 'Factory-reset the emulated iPod (erases its notes, settings, etc.)? [y/N] '
+  read -r a
+  case "$a" in y|Y|yes) ;; *) say "Cancelled."; return 0 ;; esac
+  in_debian rm -rf /root/ios/device/nandrw && say "Done. Next boot starts from a fresh iPhone OS $IOA_IOS_VERSION."
+}
+
+cmd_uninstall() {
+  local a
+  printf 'Remove the emulator, Debian and iOS from Termux (frees ~6 GB)? [y/N] '
+  read -r a
+  case "$a" in y|Y|yes) ;; *) say "Cancelled."; return 0 ;; esac
+  running && cmd_stop
+  proot-distro remove debian || true
+  rm -rf "$STATE"
+  rm -f "$PREFIX/bin/ios"
+  say "Removed. Termux and AVNC are still installed; remove them like any app, or run mac/03-undo.sh."
+}
+
+cmd_help() {
+  cat <<EOF
+${B}ios${N}: an emulated iPod touch 2G running Apple's iPhone OS $IOA_IOS_VERSION ($IOA_IOS_BUILD)
+
+  ios                 start it and open the screen in AVNC
+  ios start --wifi    start with emulated Wi-Fi (experimental; old Safari, most sites won't load)
+  ios start --sound   start with sound through PulseAudio (experimental)
+  ios view            reopen the screen in AVNC
+  ios home            press the Home button        (or 'h' on AVNC's keyboard)
+  ios power           press the Sleep/Wake button  (or 'p' on AVNC's keyboard)
+  ios off             hold Sleep/Wake so "slide to power off" appears
+  ios volup/voldown   volume buttons
+  ios screenshot      save the iPod screen to Pictures/iOS-on-Android
+  ios stop            stop the emulator
+  ios status | log    what's going on / last log lines
+  ios selftest [s]    boot without a screen and check iOS draws (default 600 s)
+  ios reset           factory-reset the emulated iPod
+  ios uninstall       remove everything this project put inside Termux
+EOF
+}
+
+sub=${1:-start}; [ $# -gt 0 ] && shift
+case "$sub" in
+  start)       cmd_start "$@" ;;
+  --wifi|--sound|--no-viewer) cmd_start "$sub" "$@" ;;
+  view|show)   need_running; open_viewer ;;
+  stop)        cmd_stop ;;
+  home)        need_running; monitor "sendkey h" ;;
+  power|lock)  need_running; monitor "sendkey p" ;;
+  off)         need_running; monitor "sendkey p 4000"; say "Now slide to power off in AVNC, then run: ios stop" ;;
+  volup)       need_running; monitor "sendkey equal" ;;
+  voldown)     need_running; monitor "sendkey minus" ;;
+  screenshot)  cmd_screenshot ;;
+  status)      cmd_status ;;
+  log|logs)    cmd_log ;;
+  selftest)    cmd_selftest "$@" ;;
+  reset)       cmd_reset ;;
+  uninstall)   cmd_uninstall ;;
+  help|-h|--help) cmd_help ;;
+  *)           warn "unknown command: $sub"; cmd_help; exit 2 ;;
+esac
